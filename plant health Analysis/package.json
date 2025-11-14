@@ -1,0 +1,13 @@
+{
+    "name": "agri-ai-analyzer",
+    "version": "1.0.0",
+    "description": "Professional Agricultural AI Image Analyzer",
+    "main": "backend/app.py",
+    "scripts": {
+      "start": "python backend/app.py"
+    },
+    "dependencies": {},
+    "devDependencies": {},
+    "author": "Your Name",
+    "license": "MIT"
+  }

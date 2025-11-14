@@ -1,0 +1,55 @@
+/* ---------- GLOBAL GREEN / WHITE ---------- */
+body { background:#f8fff8; color:#212529; }
+.navbar { background:#2e7d32 !important; }
+.navbar .nav-link { color:#fff !important; }
+.navbar .nav-link.active { font-weight:600; }
+
+.btn-green { background:#2e7d32; border-color:#2e7d32; color:#fff; }
+.btn-green:hover { background:#1b5e20; border-color:#1b5e20; }
+
+.bg-light-green { background:#e8f5e9; }
+.text-green { color:#2e7d32; }
+.text-success { color:#2e7d32; }
+
+.card, .shadow-lg { box-shadow:0 4px 12px rgba(0,0,0,0.08) !important; }
+
+#preview img { 
+    max-height:380px; 
+    border:2px solid #e8f5e9; 
+    border-radius:8px; 
+}
+
+/* Result cards */
+#result .bg-gray-50 { 
+    background:#e8f5e9 !important; 
+    border-left:4px solid #2e7d32; 
+}
+
+.card {
+    border-radius: 10px;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.btn-primary {
+    background-color: #28a745;
+    border-color: #28a745;
+}
+
+.btn-primary:hover {
+    background-color: #218838;
+    border-color: #1e7e34;
+}
+
+#preview img {
+    max-width: 100%;
+    height: auto;
+    border: 1px solid #ddd;
+    border-radius: 5px;
+}
+
+#result, #summaryResult {
+    background-color: #e9ecef;
+    padding: 15px;
+    border-radius: 5px;
+    white-space: pre-wrap;
+} 
