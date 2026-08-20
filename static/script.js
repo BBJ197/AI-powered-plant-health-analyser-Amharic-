@@ -90,7 +90,7 @@ async function openModal(recordId) {
 }
 
 // Close modal when clicking outside the content box
-function closeModal(event) {
+function closeModal(event) { 
   if (event.target.id === "detail-modal") {
     forceCloseModal();
   }
