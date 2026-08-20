@@ -8,7 +8,7 @@ import threading
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from flask import Flask, request, jsonify, Response, render_template, send_from_directory
+from flask import Flask, request, jsonify, Response, render_template
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,11 +16,8 @@ load_dotenv()
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
 # ---------------------------------------------------------------------------
-# Directories & Gemini Configuration
+# Gemini & Database Configuration
 # ---------------------------------------------------------------------------
-IMAGE_DIR = os.path.join(app.static_folder, "images")
-os.makedirs(IMAGE_DIR, exist_ok=True)
-
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
@@ -43,6 +40,7 @@ def init_db():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        # image_data is BYTEA to store raw image binaries directly in PostgreSQL
         cur.execute("""
             CREATE TABLE IF NOT EXISTS plant_health_log (
                 id SERIAL PRIMARY KEY,
@@ -54,7 +52,7 @@ def init_db():
                 disease_or_symptoms VARCHAR(255),
                 actionable_advice TEXT,
                 full_analysis TEXT,
-                image_path VARCHAR(255) NOT NULL
+                image_data BYTEA NOT NULL
             );
         """)
         conn.commit()
@@ -121,7 +119,6 @@ def analyze_image_with_gemini(image_bytes, mime_type="image/jpeg"):
     result = response.json()
     raw_ai_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-    # Clean potential markdown wrapping if returned
     clean_json_str = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_ai_text, flags=re.MULTILINE).strip()
     parsed_data = json.loads(clean_json_str)
 
@@ -131,11 +128,9 @@ def analyze_image_with_gemini(image_bytes, mime_type="image/jpeg"):
 # Database Insert Helper
 # ---------------------------------------------------------------------------
 def save_plant_record(analysis_data, image_bytes):
-    """Logs the parsed fields and the raw binary image to PostgreSQL."""
+    """Logs the parsed fields and binary image directly to PostgreSQL."""
     conn = get_db_connection()
     cur = conn.cursor()
-    
-    # Insert data and the binary image directly 
     cur.execute("""
         INSERT INTO plant_health_log (
             health_score, moisture_level, plant_type, 
@@ -151,9 +146,8 @@ def save_plant_record(analysis_data, image_bytes):
         str(analysis_data.get("disease_or_symptoms", "ምንም")),
         str(analysis_data.get("actionable_advice", "")),
         str(analysis_data.get("full_analysis", "")),
-        psycopg2.Binary(image_bytes) # <--- Convert to BYTEA here
+        psycopg2.Binary(image_bytes)  # Converts raw bytes to PostgreSQL BYTEA
     ))
-    
     record_id = cur.fetchone()[0]
     conn.commit()
     cur.close()
@@ -205,7 +199,6 @@ def video_feed():
 def analyze_frame():
     """Triggered directly by ESP32 push button or manual capture."""
     try:
-        # Check if received as raw binary JPEG or JSON base64
         if request.is_json:
             data = request.get_json()
             image_bytes = base64.b64decode(data.get("image", ""))
@@ -218,14 +211,16 @@ def analyze_frame():
         print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 📸 Frame received. Running Gemini analysis...")
         
         analysis_data = analyze_image_with_gemini(image_bytes)
-        record_id, relative_image_path = save_plant_record(analysis_data, image_bytes)
+        
+        # Save record and get ID (no local image path needed)
+        record_id = save_plant_record(analysis_data, image_bytes)
 
         print(f"✅ Saved Record #{record_id}: {analysis_data.get('plant_type')} (Health: {analysis_data.get('health_score')}%)")
 
         return jsonify({
             "status": "success",
             "record_id": record_id,
-            "image_path": relative_image_path,
+            "image_url": f"/api/image/{record_id}", # Point UI to the new image route
             "data": analysis_data
         }), 200
 
@@ -234,23 +229,48 @@ def analyze_frame():
         return jsonify({"error": str(e)}), 500
 
 # ---------------------------------------------------------------------------
-# Routes: Data API for History Cards & Modal Detail
+# Routes: Data API & Image Serving
 # ---------------------------------------------------------------------------
+@app.route("/api/image/<int:record_id>")
+def serve_image(record_id):
+    """Fetches the BYTEA image from PostgreSQL and serves it as a JPEG."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT image_data FROM plant_health_log WHERE id = %s;", (record_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not row or row[0] is None:
+            return "No photo found", 404
+
+        return Response(bytes(row[0]), mimetype="image/jpeg")
+    except Exception as e:
+        return str(e), 500
+
 @app.route("/api/records", methods=["GET"])
 def get_records():
-    """Returns past health records sorted newest first."""
+    """Returns past health records for the UI cards (excludes heavy image data)."""
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM plant_health_log ORDER BY timestamp DESC LIMIT 50;")
+        # Select specific columns to avoid crashing the JSON response with BYTEA data
+        cur.execute("""
+            SELECT id, timestamp, health_score, moisture_level, plant_type, 
+                   short_summary, disease_or_symptoms 
+            FROM plant_health_log 
+            ORDER BY timestamp DESC LIMIT 50;
+        """)
         records = cur.fetchall()
         cur.close()
         conn.close()
 
-        # Format timestamps as strings for JSON serialization
         for r in records:
             if isinstance(r["timestamp"], (datetime.datetime, datetime.date)):
                 r["timestamp"] = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+            # Inject the image URL so the frontend knows where to load the photo
+            r["image_url"] = f"/api/image/{r['id']}"
 
         return jsonify(records), 200
     except Exception as e:
@@ -258,11 +278,15 @@ def get_records():
 
 @app.route("/api/record/<int:record_id>", methods=["GET"])
 def get_single_record(record_id):
-    """Returns detailed information for the modal popup."""
+    """Returns detailed information for the modal popup (excludes heavy image data)."""
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM plant_health_log WHERE id = %s;", (record_id,))
+        cur.execute("""
+            SELECT id, timestamp, health_score, moisture_level, plant_type, 
+                   short_summary, disease_or_symptoms, actionable_advice, full_analysis 
+            FROM plant_health_log WHERE id = %s;
+        """, (record_id,))
         record = cur.fetchone()
         cur.close()
         conn.close()
@@ -272,26 +296,12 @@ def get_single_record(record_id):
 
         if isinstance(record["timestamp"], (datetime.datetime, datetime.date)):
             record["timestamp"] = record["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+            
+        record["image_url"] = f"/api/image/{record['id']}"
 
         return jsonify(record), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
-@app.route("/api/image/<int:record_id>")
-def serve_image(record_id):
-    """Fetches the BYTEA image from PostgreSQL and serves it as a JPEG."""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT image_data FROM plant_health_log WHERE id = %s;", (record_id,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    if not row or row[0] is None:
-        return "No photo found", 404
-
-    # Construct the raw HTTP response using the database bytes
-    return Response(bytes(row[0]), mimetype="image/jpeg")
 
 if __name__ == "__main__":
     init_db()
