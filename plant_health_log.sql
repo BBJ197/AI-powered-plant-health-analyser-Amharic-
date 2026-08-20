@@ -1,0 +1,14 @@
+-- CREATE TABLE plant_health_log (
+--     id SERIAL PRIMARY KEY,
+--     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+--     health_score INT NOT NULL,
+--     moisture_level INT NOT NULL,
+--     plant_type VARCHAR(100) NOT NULL,
+--     short_summary VARCHAR(255) NOT NULL,
+--     disease_or_symptoms VARCHAR(255),
+--     actionable_advice TEXT,
+--     full_analysis TEXT,
+--     image_data BYTEA NOT NULL 
+-- );
+
+-- SELECT * FROM plant_health_log;

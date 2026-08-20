@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="am">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>የእፅዋት ጤና መቆጣጠሪያ (Smart Plant Monitor)</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <header class="navbar">
+        <h1>🌱 የእፅዋት ጤና መቆጣጠሪያ ማዕከል</h1>
+        <button id="refresh-btn" onclick="fetchRecords()">⟳ አድስ (Refresh)</button>
+    </header>
+
+    <main class="container">
+        <!-- Live Video Feed Section -->
+        <section class="video-section">
+            <h2>ቀጥታ ስርጭት (Live Feed)</h2>
+            <div class="video-wrapper">
+                <img src="/video_feed" alt="ESP32-CAM Live Feed" onerror="this.src='/static/placeholder.jpg'; this.alt='ካሜራ አልተገናኘም (Camera Offline)';">
+            </div>
+        </section>
+
+        <!-- History Grid Section -->
+        <section class="history-section">
+            <h2>የምርመራ ታሪክ (Analysis History)</h2>
+            <div id="history-grid" class="grid-container">
+                <!-- Cards will be injected here by JavaScript -->
+            </div>
+        </section>
+    </main>
+
+    <!-- Detail Modal (Hidden by default) -->
+    <div id="detail-modal" class="modal hidden" onclick="closeModal(event)">
+        <div class="modal-content" onclick="event.stopPropagation()">
+            <button class="close-btn" onclick="forceCloseModal()">✖</button>
+            <div class="modal-header">
+                <img id="modal-img" src="" alt="Plant Image">
+                <div class="modal-title-group">
+                    <h2 id="modal-plant-type">Plant Type</h2>
+                    <span id="modal-timestamp" class="timestamp">Timestamp</span>
+                </div>
+            </div>
+            
+            <div class="modal-metrics">
+                <div class="metric">
+                    <span class="metric-label">የጤና ደረጃ (Health)</span>
+                    <span id="modal-health" class="metric-value">--%</span>
+                </div>
+                <div class="metric">
+                    <span class="metric-label">እርጥበት (Moisture)</span>
+                    <span id="modal-moisture" class="metric-value">--%</span>
+                </div>
+            </div>
+
+            <div class="modal-body">
+                <h3>የበሽታ ምልክቶች (Symptoms):</h3>
+                <p id="modal-symptoms" class="highlight-text"></p>
+
+                <h3>የማሻሻያ ምክር (Actionable Advice):</h3>
+                <p id="modal-advice"></p>
+
+                <h3>ዝርዝር ትንተና (Full Analysis):</h3>
+                <p id="modal-analysis"></p>
+            </div>
+        </div> 
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
