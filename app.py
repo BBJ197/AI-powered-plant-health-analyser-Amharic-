@@ -19,7 +19,15 @@ app = Flask(__name__, static_folder="static", template_folder="templates")
 # Gemini & Database Configuration
 # ---------------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+
+# Corrected endpoint with the -preview tag
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent"
+
+# Pass the API key securely via headers
+HEADERS = {
+    "Content-Type": "application/json",
+    "x-goog-api-key": GEMINI_API_KEY
+}
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "localhost"),
@@ -110,7 +118,7 @@ def analyze_image_with_gemini(image_bytes, mime_type="image/jpeg"):
 
     response = requests.post(
         GEMINI_URL,
-        headers={"Content-Type": "application/json"},
+        headers=HEADERS,
         json=body,
         timeout=60
     )
