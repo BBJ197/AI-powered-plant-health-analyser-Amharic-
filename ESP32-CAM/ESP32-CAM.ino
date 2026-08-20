@@ -10,13 +10,14 @@
 const char* ssid = "bbj";
 const char* password = "32145678";
 
-const char* streamUrl = "http://192.168.137.121:5000/upload_stream"; 
-const char* analyzeUrl = "http://192.168.137.121:5000/analyze_frame";
+const char* streamUrl = "http://192.168.1.2:5000/upload_stream"; 
+const char* analyzeUrl = "http://192.168.1.2:5000/analyze_frame";
 
 // ---------------------------------------------------------------------------
 // Pin Definitions
 // ---------------------------------------------------------------------------
-#define BUTTON_PIN 13  // ✅ Safe pin. Not a strapping pin. Freed by 1-bit SD mode.
+#define BUTTON_PIN 13  
+#define LED_PIN 4  
 
 // AI-Thinker OV2640 Pins
 #define PWDN_GPIO_NUM     32
@@ -160,7 +161,18 @@ void setupSDCard() {
 // Action Functions
 // ---------------------------------------------------------------------------
 void captureAndQueueImage() {
+  // 1. Turn on the flash LED
+  digitalWrite(LED_PIN, HIGH);
+  
+  // 2. Wait 150ms to let the camera sensor adjust auto-exposure
+  delay(150); 
+
+  // 3. Take the picture
   camera_fb_t *fb = esp_camera_fb_get();
+  
+  // 4. Turn the flash LED off immediately
+  digitalWrite(LED_PIN, LOW);
+
   if (!fb) {
     Serial.println("❌ Camera capture failed.");
     return;
@@ -225,6 +237,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  pinMode(LED_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   setupSDCard();
@@ -249,20 +262,18 @@ void loop() {
 
   unsigned long now = millis();
   
+  // --- Edge Detection & Debounce Logic (CORRECTED) ---
   bool reading = digitalRead(BUTTON_PIN);
-  if (reading != lastButtonState) {
-    lastDebounceTime = now;
-  }
-
-  if ((now - lastDebounceTime) > DEBOUNCE_DELAY) {
-    if (reading == LOW && lastButtonState == HIGH) {
+  
+  if (reading == LOW && lastButtonState == HIGH) {
+    if ((now - lastDebounceTime) > DEBOUNCE_DELAY) {
       Serial.println("\n🚨 Button Press Detected! Capturing instantly...");
       captureAndQueueImage();
-      lastButtonState = reading; 
-    } else if (reading == HIGH) {
-      lastButtonState = HIGH;
+      lastDebounceTime = now; // Reset timer after a successful press
     }
   }
+  
+  lastButtonState = reading; // Update the state at the end of the loop
 
   if (now - lastStreamTime >= STREAM_INTERVAL_MS) {
     lastStreamTime = now;
