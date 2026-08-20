@@ -1,224 +1,298 @@
-from flask import Flask, request, jsonify, render_template, send_from_directory
-import base64, requests, time, json, datetime, os
+import os
+import re
+import time
+import json
+import base64
+import datetime
+import threading
+import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from flask import Flask, request, jsonify, Response, render_template, send_from_directory
+from dotenv import load_dotenv
 
-# 🔐 Gemini API Key
-GEMINI_API_KEY = "Add your Gemini api key here"  # Replace with your actual key from Google AI Studio
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-001:generateContent"
-HEADERS = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+load_dotenv()
 
-# ESP32-CAM IP (update with IP from Serial Monitor, e.g., 192.168.137.202)
-ESP_IP = "192.168.137.121"  # Replace with your ESP32-CAM's actual IP
+app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# 🧠 Flask setup
-app = Flask(__name__, static_folder='static', template_folder='templates')
+# ---------------------------------------------------------------------------
+# Directories & Gemini Configuration
+# ---------------------------------------------------------------------------
+IMAGE_DIR = os.path.join(app.static_folder, "images")
+os.makedirs(IMAGE_DIR, exist_ok=True)
 
-# 🗃️ In-memory + file log
-LOG_FILE = "ai_analysis_log.jsonl"
-IMAGE_DIR = "images"  # Folder for saving images
-analyses = []  # Keeps recent data for fast summaries
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
 
-# Create images directory if it doesn't exist
-if not os.path.exists(os.path.join(app.static_folder, IMAGE_DIR)):
-    os.makedirs(os.path.join(app.static_folder, IMAGE_DIR))
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", 5432)),
+    "dbname": os.getenv("DB_NAME", "plant_db"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD", ""),
+}
 
-PROMPT ="""
-መልሱን በሙሉ በአማርኛ ስጥ
-የእፅዋት ጤና ሁኔታን ከ0 እስከ 100 ባለው ነጥብ አሳይ
-የመሬት እርጥበት ደረጃን በመቶኛ አሳይ
-የተክል አይነትን በግልፅ ጥቀስ (ለምሳሌ ቲማቲም በቆሎ ቡና ጤፍ ስንዴ ወዘተ)
-የበሽታ አይነት ወይም የደረቅነት ምልክቶችን በአማርኛ ጥቀስ እና የበሽታውን ስም በእንግሊዝኛ በቅንፍ () ውስጥ ጨምር
-አንድ ቀላል እና ተግባራዊ የማሻሻያ ምክር ስጥ እና በግልፅ አብራራ
-እንደ * ያሉ የነጥብ ምልክቶችን አትጠቀም
-ከ “የእፅዋት ጤና ሁኔታ” በፊት ምንም አይነት ሐረግ አትጀምር
+# ---------------------------------------------------------------------------
+# Database Utilities
+# ---------------------------------------------------------------------------
+def get_db_connection():
+    return psycopg2.connect(**DB_CONFIG)
+
+def init_db():
+    """Ensures the required table exists on startup."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS plant_health_log (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                health_score INT NOT NULL,
+                moisture_level INT NOT NULL,
+                plant_type VARCHAR(100) NOT NULL,
+                short_summary VARCHAR(255) NOT NULL,
+                disease_or_symptoms VARCHAR(255),
+                actionable_advice TEXT,
+                full_analysis TEXT,
+                image_path VARCHAR(255) NOT NULL
+            );
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Database initialized successfully.")
+    except Exception as e:
+        print(f"⚠️ Database connection failed: {e}")
+
+# ---------------------------------------------------------------------------
+# Live Feed State (Thread-Safe)
+# ---------------------------------------------------------------------------
+feed_lock = threading.Lock()
+latest_frame_bytes = None
+
+# ---------------------------------------------------------------------------
+# Gemini AI Prompt (Strict JSON Output)
+# ---------------------------------------------------------------------------
+AMHARIC_PROMPT = """
+ምስሉን በጥንቃቄ ተመልክተህ ትንተናህን በ JSON ቅርጸት (JSON format) ብቻ አቅርብ።
+መልስህ ምንም አይነት ተጨማሪ የMarkdown መክፈቻ ወይም መዝጊያ (እንደ ```json) ማካተት የለበትም፤ ንፁህ JSON ብቻ ይሁን።
+
+የሚከተሉትን ቁልፎች (keys) ተጠቀም:
+{
+  "health_score": (የእፅዋት አጠቃላይ ጤና ከ 0 እስከ 100 ባለው ኢንቲጀር ቁጥር),
+  "moisture_level": (የአፈር ወይም የተክል እርጥበት ግምት ከመቶ 0 እስከ 100 ባለው ኢንቲጀር ቁጥር),
+  "plant_type": "(የተክሉ አይነት ስም በአማርኛ፤ ለምሳሌ፡ ቲማቲም፣ በቆሎ፣ ቡና፣ ጤፍ፣ ስንዴ)",
+  "disease_or_symptoms": "(የበሽታው አይነት ወይም የደረቅነት ምልክቶች በአማርኛ እና የእንግሊዝኛ ስሙ በቅንፍ ውስጥ፤ ምንም ከሌለ 'ጤናማ' በል)",
+  "short_summary": "(ለዋናው ካርድ ማሳያ የሚሆን በጣም አጭር የአንድ ዓረፍተ ነገር ማጠቃለያ በአማርኛ)",
+  "actionable_advice": "(ቀላል እና ተግባራዊ የሆነ የማሻሻያ ወይም የእንክብካቤ ምክር በአማርኛ)",
+  "full_analysis": "(የተሟላ እና ዝርዝር ያለ የምርመራ ትንተና በአማርኛ)"
+}
 """
 
-# 📦 Utility: load old logs on startup
-def load_logs():
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                analyses.append(json.loads(line))
-        print(f"✅ Loaded {len(analyses)} past records.")
-    except FileNotFoundError:
-        print("ℹ️ No previous log file found.")
+def analyze_image_with_gemini(image_bytes, mime_type="image/jpeg"):
+    """Sends image bytes to Google Gemini and parses the structured JSON output."""
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY is not set.")
 
-def save_log(entry, image_b64=None):
-    analyses.append(entry)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    # Save image if provided
-    if image_b64:
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        image_path = os.path.join(app.static_folder, IMAGE_DIR, f"image_{timestamp}.jpg")
-        with open(image_path, "wb") as f:
-            f.write(base64.b64decode(image_b64))
-        entry["image_path"] = f"{IMAGE_DIR}/image_{timestamp}.jpg"
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-# Serve static files (CSS, JS, images)
-@app.route('/static/<path:path>')
-def send_static(path):
-    return send_from_directory('static', path)
-
-@app.route("/")
-def home():
-    return render_template('index.html')
-
-@app.route("/summary_page")
-def summary_page():
-    return render_template('summary.html')
-
-# Route to capture from ESP and analyze with retries
-@app.route("/capture_and_analyze", methods=["GET"])
-def capture_and_analyze():
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            # Fetch image from ESP32-CAM
-            esp_url = f"http://{ESP_IP}/capture"
-            print(f"Fetching from ESP at {esp_url}")
-            esp_response = requests.get(esp_url, timeout=10)
-            esp_response.raise_for_status()
-            data = esp_response.json()
-            image_b64 = data["image"]
-            mime_type = data.get("mime_type", "image/jpeg")
-
-            # Process with Gemini
-            body = {
-                "contents": [
-                    {
-                        "parts": [
-                            {"text": PROMPT},
-                            {"inline_data": {"mime_type": mime_type, "data": image_b64}}
-                        ]
-                    }
+    body = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": AMHARIC_PROMPT},
+                    {"inline_data": {"mime_type": mime_type, "data": image_b64}}
                 ]
             }
-            print("Sending request to Gemini API")
-            response = requests.post(GEMINI_URL, headers=HEADERS, json=body, timeout=100)
-            response.raise_for_status()
-            result = response.json()
-            ai_text = result["candidates"][0]["content"]["parts"][0]["text"]
-
-            # Save with timestamp and image
-            entry = {
-                "timestamp": time.time(),
-                "analysis": ai_text
-            }
-            save_log(entry, image_b64)
-
-            print(f"✅ Saved analysis and image at {datetime.datetime.now()}")
-            return jsonify({"status": "ok", "analysis": ai_text, "image_b64": image_b64})
-
-        except (requests.exceptions.HTTPError, requests.exceptions.ReadTimeout) as e:
-            if (isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 503) or isinstance(e, requests.exceptions.ReadTimeout):
-                if attempt < max_retries - 1:
-                    print(f"❌ {type(e).__name__} on attempt {attempt + 1}. Retrying in {5 * (attempt + 1)} seconds...")
-                    time.sleep(5 * (attempt + 1))
-                    continue
-            print(f"❌ {type(e).__name__} Error:", str(e))
-            return jsonify({"error": str(e)}), 500
-        except Exception as e:
-            print("❌ General Error:", str(e), type(e).__name__)
-            return jsonify({"error": str(e)}), 500
-    return jsonify({"error": "Max retries exceeded due to connection errors"}), 500
-
-# Manual upload route
-@app.route("/upload", methods=["POST"])
-def upload():
-    try:
-        data = request.get_json()
-        if not data or "image" not in data:
-            return jsonify({"error": "Missing image data"}), 400
-
-        image_b64 = data["image"]
-        mime_type = data.get("mime_type", "image/jpeg")
-
-        body = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": PROMPT},
-                        {"inline_data": {"mime_type": mime_type, "data": image_b64}}
-                    ]
-                }
-            ]
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json"
         }
+    }
 
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = requests.post(GEMINI_URL, headers=HEADERS, json=body, timeout=60)
-                response.raise_for_status()
-                result = response.json()
-                ai_text = result["candidates"][0]["content"]["parts"][0]["text"]
+    response = requests.post(
+        GEMINI_URL,
+        headers={"Content-Type": "application/json"},
+        json=body,
+        timeout=60
+    )
+    response.raise_for_status()
 
-                entry = {
-                    "timestamp": time.time(),
-                    "analysis": ai_text
-                }
-                save_log(entry, image_b64)
+    result = response.json()
+    raw_ai_text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-                print(f"✅ Saved analysis and image at {datetime.datetime.now()}")
-                return jsonify({"status": "ok", "analysis": ai_text})
+    # Clean potential markdown wrapping if returned
+    clean_json_str = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_ai_text, flags=re.MULTILINE).strip()
+    parsed_data = json.loads(clean_json_str)
 
-            except (requests.exceptions.HTTPError, requests.exceptions.ReadTimeout) as e:
-                if (isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 503) or isinstance(e, requests.exceptions.ReadTimeout):
-                    if attempt < max_retries - 1:
-                        print(f"❌ {type(e).__name__} on attempt {attempt + 1}. Retrying in {5 * (attempt + 1)} seconds...")
-                        time.sleep(5 * (attempt + 1))
-                        continue
-                print(f"❌ {type(e).__name__} Error:", str(e))
-                return jsonify({"error": str(e)}), 500
-    except Exception as e:
-                print("❌ General Error:", str(e))
-                return jsonify({"error": str(e)}), 500
-    return jsonify({"error": "Max retries exceeded due to connection errors"}), 500
+    return parsed_data
 
-# Summaries by time window
-# ────── inside app.py ──────
-@app.route("/summary", methods=["GET"])
-def summary():
+# ---------------------------------------------------------------------------
+# Database Insert Helper
+# ---------------------------------------------------------------------------
+def save_plant_record(analysis_data, image_bytes):
+    """Logs the parsed fields and the raw binary image to PostgreSQL."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Insert data and the binary image directly 
+    cur.execute("""
+        INSERT INTO plant_health_log (
+            health_score, moisture_level, plant_type, 
+            short_summary, disease_or_symptoms, actionable_advice, 
+            full_analysis, image_data
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id;
+    """, (
+        int(analysis_data.get("health_score", 0)),
+        int(analysis_data.get("moisture_level", 0)),
+        str(analysis_data.get("plant_type", "ያልታወቀ")),
+        str(analysis_data.get("short_summary", "")),
+        str(analysis_data.get("disease_or_symptoms", "ምንም")),
+        str(analysis_data.get("actionable_advice", "")),
+        str(analysis_data.get("full_analysis", "")),
+        psycopg2.Binary(image_bytes) # <--- Convert to BYTEA here
+    ))
+    
+    record_id = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return record_id
+
+# ---------------------------------------------------------------------------
+# Routes: Web UI & Static Streaming
+# ---------------------------------------------------------------------------
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+@app.route("/upload_stream", methods=["POST"])
+def upload_stream():
+    """Continuous stream frames pushed from the ESP32-CAM."""
+    global latest_frame_bytes
+    if not request.data:
+        return "No image data", 400
+
+    with feed_lock:
+        latest_frame_bytes = request.data
+    return "OK", 200
+
+def generate_stream():
+    while True:
+        with feed_lock:
+            frame = latest_frame_bytes
+
+        if frame is None:
+            time.sleep(0.05)
+            continue
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+        )
+        time.sleep(0.03)
+
+@app.route("/video_feed")
+def video_feed():
+    return Response(generate_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# ---------------------------------------------------------------------------
+# Routes: Analysis Trigger (Button POST or Web Form)
+# ---------------------------------------------------------------------------
+@app.route("/analyze_frame", methods=["POST"])
+def analyze_frame():
+    """Triggered directly by ESP32 push button or manual capture."""
     try:
-        now = time.time()
-        periods = {
-            "hour": 3600,
-            "day": 86400,
-            "week": 604800,
-            "month": 2592000,
-            "year": 31536000
-        }
-        summary_data = {}
-        for name, seconds in periods.items():
-            start = now - seconds
-            items = [a for a in analyses if a["timestamp"] >= start]
-            summary_data[name] = {
-                "count": len(items),
-                # ────── CHANGE: return *all* items, not just last 3 ──────
-                "sample": [
-                    {"analysis": a["analysis"], "image_path": a.get("image_path", "")}
-                    for a in items
-                ][::-1]   # newest first
-            }
-        return jsonify(summary_data)
+        # Check if received as raw binary JPEG or JSON base64
+        if request.is_json:
+            data = request.get_json()
+            image_bytes = base64.b64decode(data.get("image", ""))
+        else:
+            image_bytes = request.data
+
+        if not image_bytes:
+            return jsonify({"error": "No image payload received"}), 400
+
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] 📸 Frame received. Running Gemini analysis...")
+        
+        analysis_data = analyze_image_with_gemini(image_bytes)
+        record_id, relative_image_path = save_plant_record(analysis_data, image_bytes)
+
+        print(f"✅ Saved Record #{record_id}: {analysis_data.get('plant_type')} (Health: {analysis_data.get('health_score')}%)")
+
+        return jsonify({
+            "status": "success",
+            "record_id": record_id,
+            "image_path": relative_image_path,
+            "data": analysis_data
+        }), 200
+
     except Exception as e:
-        print("Summary Error:", str(e))
+        print(f"❌ Analysis failed: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Clear logs route
-@app.route("/clear_logs", methods=["POST"])
-def clear_logs():
+# ---------------------------------------------------------------------------
+# Routes: Data API for History Cards & Modal Detail
+# ---------------------------------------------------------------------------
+@app.route("/api/records", methods=["GET"])
+def get_records():
+    """Returns past health records sorted newest first."""
     try:
-        analyses.clear()
-        open(LOG_FILE, "w").close()
-        # Optionally, delete saved images
-        for file in os.listdir(os.path.join(app.static_folder, IMAGE_DIR)):
-            os.remove(os.path.join(app.static_folder, IMAGE_DIR, file))
-        print("✅ Cleared logs and images")
-        return jsonify({"status": "cleared"})
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM plant_health_log ORDER BY timestamp DESC LIMIT 50;")
+        records = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Format timestamps as strings for JSON serialization
+        for r in records:
+            if isinstance(r["timestamp"], (datetime.datetime, datetime.date)):
+                r["timestamp"] = r["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+
+        return jsonify(records), 200
     except Exception as e:
-        print("❌ Clear Logs Error:", str(e))
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/record/<int:record_id>", methods=["GET"])
+def get_single_record(record_id):
+    """Returns detailed information for the modal popup."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM plant_health_log WHERE id = %s;", (record_id,))
+        record = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not record:
+            return jsonify({"error": "Record not found"}), 404
+
+        if isinstance(record["timestamp"], (datetime.datetime, datetime.date)):
+            record["timestamp"] = record["timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+
+        return jsonify(record), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route("/api/image/<int:record_id>")
+def serve_image(record_id):
+    """Fetches the BYTEA image from PostgreSQL and serves it as a JPEG."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT image_data FROM plant_health_log WHERE id = %s;", (record_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not row or row[0] is None:
+        return "No photo found", 404
+
+    # Construct the raw HTTP response using the database bytes
+    return Response(bytes(row[0]), mimetype="image/jpeg")
 
 if __name__ == "__main__":
-    load_logs()
-    app.run(host="0.0.0.0", port=5000)
+    init_db()
+    app.run(host="0.0.0.0", port=5000, threaded=True)
